@@ -1,0 +1,7 @@
+# Пути к папкам относительно файла train.py
+train: train/images
+val: valid/images
+
+
+nc: 1 
+names: ['person']
