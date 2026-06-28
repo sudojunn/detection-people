@@ -137,17 +137,35 @@ def draw_person_box(img, box, idx, color=BOX_COLOR):
     corner = max(12, int(18 * scale))
     cw = max(2, lw + 1)
 
+    # Отрисовка основной рамки детекции
     cv2.rectangle(img, (x1, y1), (x2, y2), color, lw)
-    for cx, cy, dx, dy in (
+    for cx_point, cy, dx, dy in (
         (x1, y1, 1, 1),
         (x2, y1, -1, 1),
         (x1, y2, 1, -1),
         (x2, y2, -1, -1),
     ):
-        cv2.line(img, (cx, cy), (cx + dx * corner, cy), color, cw)
-        cv2.line(img, (cx, cy), (cx, cy + dy * corner), color, cw)
+        cv2.line(img, (cx_point, cy), (cx_point + dx * corner, cy), color, cw)
+        cv2.line(img, (cx_point, cy), (cx_point, cy + dy * corner), color, cw)
 
     draw_label(img, f"person #{idx} {conf:.0%}", (x1, y1), color)
+    
+    # Визуализация датчиков в зависимости от режима (Весь бокс или Нижняя грань)
+    if widgets["full_box_var"].get():
+        # Подсветка внутреннего периметра рамки (весь прямоугольник — датчик)
+        cv2.rectangle(img, (x1 + 3, y1 + 3), (x2 - 3, y2 - 3), (255, 255, 0), 1)
+    else:
+        # Расчет динамической длины линии-датчика на основе ползунка
+        z_scale = widgets["zone_scale_var"].get()
+        cx = (x1 + x2) / 2
+        hw_adj = ((x2 - x1) / 2) * z_scale
+        bl_x = int(cx - hw_adj)
+        br_x = int(cx + hw_adj)
+        
+        if z_scale > 0:
+            cv2.line(img, (bl_x, y2), (br_x, y2), (255, 255, 0), lw + 1)
+        else:
+            cv2.circle(img, (int(cx), y2), lw + 2, (255, 255, 0), -1)
 
 
 def draw_zones(img):
@@ -207,31 +225,48 @@ def segments_intersect(a, b, c, d):
     return ccw(a, c, d) != ccw(b, c, d) and ccw(a, b, c) != ccw(a, b, d)
 
 
-def point_in_box(point, x1, y1, x2, y2):
-    return x1 <= point[0] <= x2 and y1 <= point[1] <= y2
-
-
 def box_in_any_zone(box):
     if not state["zones"]:
         return False
 
     x1, y1, x2, y2 = map(int, box.xyxy[0])
-    box_points = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
+    
+    # РЕЖИМ 1: Детекция по всему прямоугольнику (Камера сверху)
+    if widgets["full_box_var"].get():
+        corners = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
+        box_edges = [(corners[0], corners[1]), (corners[1], corners[2]), 
+                     (corners[2], corners[3]), (corners[3], corners[0])]
+                     
+        for zone in state["zones"]:
+            polygon = np.array(zone, dtype=np.int32)
+            # Проверка: находится ли хоть один угол рамки внутри зоны
+            if any(cv2.pointPolygonTest(polygon, pt, False) >= 0 for pt in corners):
+                return True
+            # Проверка: пересекает ли хоть одна грань рамки границы зоны
+            zone_edges = list(zip(zone, zone[1:] + zone[:1]))
+            if any(segments_intersect(b_p1, b_p2, z_p1, z_p2) 
+                   for b_p1, b_p2 in box_edges for z_p1, z_p2 in zone_edges):
+                return True
+        return False
 
-    for zone in state["zones"]:
-        polygon = np.array(zone, dtype=np.int32)
-        
-        if any(cv2.pointPolygonTest(polygon, point, False) >= 0 for point in box_points):
-            return True
-        if any(point_in_box(point, x1, y1, x2, y2) for point in zone):
-            return True
+    # РЕЖИМ 2: Динамический сегментарный контроль нижней грани
+    else:
+        z_scale = widgets["zone_scale_var"].get()
+        cx = (x1 + x2) / 2
+        hw_adj = ((x2 - x1) / 2) * z_scale
+        bottom_left = (int(cx - hw_adj), y2)
+        bottom_right = (int(cx + hw_adj), y2)
 
-        box_edges = list(zip(box_points, box_points[1:] + box_points[:1]))
-        zone_edges = list(zip(zone, zone[1:] + zone[:1]))
-        if any(segments_intersect(a, b, c, d) for a, b in box_edges for c, d in zone_edges):
-            return True
-            
-    return False
+        for zone in state["zones"]:
+            polygon = np.array(zone, dtype=np.int32)
+            if cv2.pointPolygonTest(polygon, bottom_left, False) >= 0:
+                return True
+            if cv2.pointPolygonTest(polygon, bottom_right, False) >= 0:
+                return True
+            zone_edges = list(zip(zone, zone[1:] + zone[:1]))
+            if any(segments_intersect(bottom_left, bottom_right, z_p1, z_p2) for z_p1, z_p2 in zone_edges):
+                return True
+        return False
 
 
 def analyze_frame(frame):
@@ -258,11 +293,21 @@ def analyze_frame(frame):
             state["last_alarm_at"] = now
             alert = True
             play_alarm()
+            
+            current_time = time.strftime("%Y-%m-%d %H:%M:%S")
+            video_name = Path(state["video_path"]).name if state["video_path"] else "Неизвестная камера"
+            log_message = f"[{current_time}] Камера: {video_name} | ТРЕВОГА: Человек в опасной зоне!\n"
+            
+            try:
+                log_path = Path(__file__).parent / "log.txt"
+                with open(log_path, "a", encoding="utf-8") as log_file:
+                    log_file.write(log_message)
+            except Exception as e:
+                print(f"Ошибка записи лога: {e}")
 
     state["breach_inside"] = body_inside_now
 
     zone_count = len(state["zones"])
-    
     if state["setting_zone"]:
         curr_zone_idx = zone_count
         if curr_zone_idx < len(state["zones_config"]):
@@ -433,7 +478,6 @@ def show_zone_config_dialog():
     tk.Label(f1, text="Кол-во зон:", bg=BG, fg=MUTED, font=("Courier", 11), width=15, anchor="e").pack(side="left")
     
     zones_var = tk.IntVar(value=state.get("target_zones_count", 1))
-    
     rows_frame = tk.Frame(dialog, bg=BG)
     rows_frame.pack(fill="x", pady=5)
     
@@ -598,7 +642,7 @@ def reset_zones():
     state["zone_points"] = []
     state["setting_zone"] = False
     state["breach_inside"] = False
-    set_status("все зоны сброшены", MUTED)
+    set_status("все zones сброшены", MUTED)
     render_current_frame()
 
 
@@ -668,6 +712,24 @@ def on_seek_change(value):
 
 def on_conf_change(_=None):
     state["breach_inside"] = False
+    render_current_frame()
+
+
+def on_zone_scale_change(_=None):
+    state["breach_inside"] = False
+    render_current_frame()
+
+
+def on_full_box_toggle():
+    state["breach_inside"] = False
+    
+    # Блокируем или разблокируем ползунок датчика нижней грани для наглядности интерфейса
+    if widgets["full_box_var"].get():
+        widgets["zone_scale_slider"].config(state="disabled", troughcolor="#222")
+    else:
+        widgets["zone_scale_slider"].config(state="normal", troughcolor="#333")
+        
+    render_current_frame()
 
 
 def on_speed_change(value):
@@ -693,7 +755,8 @@ def save_snapshot():
     )
     if path:
         cv2.imwrite(path, state["result_img"])
-        set_status(f"сохранено: {Path(path).name}", ACCENT)
+        filename = Path(path).name
+        set_status(f"сохранено: {filename}", ACCENT)
 
 
 def build_button(parent, text, command, width, fg=TEXT):
@@ -748,7 +811,6 @@ def build_ui():
     widgets["canvas"] = tk.Canvas(canvas_frame, bg=SURFACE, bd=0, highlightthickness=0)
     widgets["canvas"].pack(fill="both", expand=True)
     
-    # ── ИСПРАВЛЕНИЕ: ДИНАМИЧЕСКОЕ ЦЕНТРИРОВАНИЕ ТЕКСТА ──
     def center_welcome_text(event):
         if state["current_frame"] is None:
             event.widget.delete("welcome_text")
@@ -796,6 +858,7 @@ def build_ui():
     widgets["info_label"] = tk.Label(bottom, text="", bg=SURFACE, fg=MUTED, font=("Courier", 11))
     widgets["info_label"].pack(side="left")
 
+    # Конфигурация порогов детектора
     widgets["conf_var"] = tk.DoubleVar(value=0.35)
     tk.Label(bottom, text="conf:", bg=SURFACE, fg=MUTED, font=("Courier", 11)).pack(side="right", padx=(0, 4))
     tk.Scale(
@@ -811,12 +874,51 @@ def build_ui():
         highlightthickness=0,
         bd=0,
         font=("Courier", 10),
-        length=120,
+        length=100,
         command=on_conf_change,
     ).pack(side="right")
 
+    # ПОЛЗУНОК НАСТРОЙКИ РАЗМЕРА ДАТЧИКА (ОТ ТОЧКИ В ЦЕНТРЕ ДО ВСЕЙ НИЖНЕЙ СТОРОНЫ)
+    widgets["zone_scale_var"] = tk.DoubleVar(value=1.0)
+    tk.Label(bottom, text="датчик:", bg=SURFACE, fg=MUTED, font=("Courier", 11)).pack(side="right", padx=(12, 4))
+    widgets["zone_scale_slider"] = tk.Scale(
+        bottom,
+        from_=0.0,
+        to=1.0,
+        resolution=0.05,
+        orient="horizontal",
+        variable=widgets["zone_scale_var"],
+        bg=SURFACE,
+        fg=TEXT,
+        troughcolor="#333",
+        highlightthickness=0,
+        bd=0,
+        font=("Courier", 10),
+        length=100,
+        command=on_zone_scale_change,
+    )
+    widgets["zone_scale_slider"].pack(side="right")
+
+    # ГАЛОЧКА ДЛЯ ВКЛЮЧЕНИЯ ДЕТЕКЦИИ ПО ВСЕМУ ПРЯМОУГОЛЬНИКУ ЧЕЛОВЕКА (КАМЕРА СВЕРХУ)
+    widgets["full_box_var"] = tk.BooleanVar(value=False)
+    widgets["full_box_check"] = tk.Checkbutton(
+        bottom,
+        text="весь бокс",
+        variable=widgets["full_box_var"],
+        bg=SURFACE,
+        fg=TEXT,
+        selectcolor=SURFACE,
+        activebackground=SURFACE,
+        activeforeground=TEXT,
+        font=("Courier", 11),
+        bd=0,
+        highlightthickness=0,
+        command=on_full_box_toggle
+    )
+    widgets["full_box_check"].pack(side="right", padx=(14, 4))
+
     widgets["speed_var"] = tk.DoubleVar(value=1.0)
-    widgets["speed_label"] = tk.Label(bottom, text="speed: 1x", bg=SURFACE, fg=MUTED, font=("Courier", 11), width=12, anchor="w")
+    widgets["speed_label"] = tk.Label(bottom, text="speed: 1x", bg=SURFACE, fg=MUTED, font=("Courier", 11), width=11, anchor="w")
     widgets["speed_label"].pack(side="right", padx=(14, 4))
     tk.Scale(
         bottom,
@@ -831,7 +933,7 @@ def build_ui():
         highlightthickness=0,
         bd=0,
         font=("Courier", 10),
-        length=140,
+        length=110,
         command=on_speed_change,
     ).pack(side="right")
 
